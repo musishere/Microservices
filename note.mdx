@@ -1,0 +1,90 @@
+**In Identity service**
+-Implement rate limiting for global hit
+const globalRateLimiter = new RateLimiterRedis({
+storeClient: redis,
+keyPrefix: "global",
+points: 60, // allow 60 requests
+duration: 1, // per 1 second
+});
+
+app.use(async (req, res, next) => {
+try {
+const rlRes = await globalRateLimiter.consume(req.ip);
+
+    res.setHeader("X-RateLimit-Limit", rlRes.remainingPoints + 1);
+    res.setHeader("X-RateLimit-Remaining", rlRes.remainingPoints);
+    res.setHeader("X-RateLimit-Reset", rlRes.msBeforeNext / 1000);
+
+    next();
+
+} catch (rejRes) {
+logger.warn("Global rate limit exceeded", {
+ip: req.ip,
+remainingPoints: rejRes.remainingPoints,
+});
+
+    res.status(429).json({
+      error: "Too many requests",
+      message: "Please try again later",
+    });
+
+}
+});
+-Implement rate limiting for sensitive endpoints
+const sensitiveRateLimiter = new RateLimiterRedis({
+storeClient: redis,
+keyPrefix: "sensitive",
+points: 50, // max 50 requests
+duration: 15 \* 60, // per 15 minutes
+});
+
+// middleware for sensitive routes
+const sensitiveEndpointsRateLimit = async (req, res, next) => {
+try {
+await sensitiveRateLimiter.consume(req.ip);
+next();
+} catch {
+logger.warn("Sensitive rate limit exceeded", { ip: req.ip });
+res.status(429).json({
+error: "Too many requests",
+message: "Please try again later",
+});
+}
+};
+
+**In Api-gateway**
+-Implement rate limiting for global hit
+-Implement rate limiting for sensitive endpoints
+-create proxy for routing /v1/auth/register->3000 ->3001
+const proxyOptions = {
+proxyReqPathResolver: (req) => {
+return req.originalUrl.replace(/\/v1/, "api");
+},
+proxyErrorHandler: (err, res, next) => {
+if (err.code === "ECONNREFUSED") {
+logger.error("Service Unavailable", {
+service: err.host,
+error: err.message,
+});
+res.status(500).json({ error: "Service Unavailable" });
+} else {
+next(err);
+}
+},
+};
+
+app.use("v2/auth", proxy(process.env.IDENTITY_SERVICE_URL, ...proxyOptions), {
+proxyReqOptDecorator: (proxyReqOpts, srcReq) => {
+proxyReqOpts.headers["Content-Type"] = "application/json";
+return proxyReqOpts;
+},
+userResDecorator: (proxyRes, srcReq, res) => {
+res.setHeader("X-RateLimit-Limit", proxyRes.headers["x-ratelimit-limit"]);
+res.setHeader(
+"X-RateLimit-Remaining",
+proxyRes.headers["x-ratelimit-remaining"]
+);
+res.setHeader("X-RateLimit-Reset", proxyRes.headers["x-ratelimit-reset"]);
+return proxyRes;
+},
+});
